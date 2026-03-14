@@ -1,6 +1,6 @@
 #property strict
-#property version   "1.00"
-#property description "Prop-first Opening Range Breakout (V1)"
+#property version   "1.10"
+#property description "Prop-first Opening Range Breakout (V1.1)"
 
 #include <Trade/Trade.mqh>
 
@@ -8,7 +8,7 @@
 // INPUTS
 // ============================================================
 input string   InpTradeSymbol             = "EURUSD"; // Símbolo a operar
-input int      InpSessionStartHour        = 8;        // Inicio de sesión (hora servidor)
+input int      InpSessionStartHour        = 8;        // Inicio de sesión (hora servidor, asumir servidor UTC+3 en prop firm)
 input int      InpSessionStartMinute      = 0;        // Inicio de sesión (minuto)
 input int      InpORMinutes               = 15;       // Minutos de Opening Range
 input int      InpTradeCutoffMin          = 90;       // Minutos máximo para ruptura tras inicio de sesión
@@ -79,6 +79,11 @@ double   g_tp2Price = 0.0;
 double   g_initialRiskPoints = 0.0;
 double   g_initialRiskMoney = 0.0;
 string   g_entryReason = "";
+string   g_entryDirection = "";
+ulong    g_positionId = 0;
+double   g_tradeRealizedPnl = 0.0;
+double   g_lastSpreadAtEntry = 0.0;
+double   g_lastAtrAtEntry = 0.0;
 
 // control de pérdidas
 double   g_initialEquity = 0.0;
@@ -144,6 +149,55 @@ void ResetSessionState()
    g_initialRiskPoints = 0.0;
    g_initialRiskMoney = 0.0;
    g_entryReason = "";
+   g_entryDirection = "";
+   g_positionId = 0;
+   g_tradeRealizedPnl = 0.0;
+   g_lastSpreadAtEntry = 0.0;
+   g_lastAtrAtEntry = 0.0;
+}
+
+int VolumeDigitsByStep(const double step)
+{
+   if(step <= 0.0)
+      return 2;
+
+   int digits = 0;
+   double s = step;
+   while(digits < 8 && MathAbs(s - MathRound(s)) > 1e-8)
+   {
+      s *= 10.0;
+      digits++;
+   }
+   return digits;
+}
+
+double NormalizeVolumeByStep(double volume)
+{
+   double volMin  = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MIN);
+   double volMax  = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MAX);
+   double volStep = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_STEP);
+
+   if(volStep <= 0.0)
+      volStep = (volMin > 0.0 ? volMin : 0.01);
+
+   volume = MathFloor(volume / volStep) * volStep;
+   volume = MathMax(volume, volMin);
+   volume = MathMin(volume, volMax);
+   return NormalizeDouble(volume, VolumeDigitsByStep(volStep));
+}
+
+double CalcMoneyRiskForVolume(const double volume, const double entryPrice, const double slPrice)
+{
+   double tickSize  = SymbolInfoDouble(g_symbol, SYMBOL_TRADE_TICK_SIZE);
+   double tickValue = SymbolInfoDouble(g_symbol, SYMBOL_TRADE_TICK_VALUE);
+   if(tickSize <= 0.0 || tickValue <= 0.0 || volume <= 0.0)
+      return 0.0;
+
+   double slDist = MathAbs(entryPrice - slPrice);
+   if(slDist <= 0.0)
+      return 0.0;
+
+   return (slDist / tickSize) * tickValue * volume;
 }
 
 void UpdateDayAnchors()
@@ -279,6 +333,21 @@ bool CurrencyIsRelevant(const string eventCurrency)
    return false;
 }
 
+// Nota backtest: el calendario económico puede no estar disponible/completo
+// según broker/entorno del Strategy Tester. En ese caso se bloquean entradas
+// para priorizar seguridad prop-first.
+bool GetEventCurrency(const MqlCalendarEvent &ev, string &currency)
+{
+   currency = "";
+
+   MqlCalendarCountry country;
+   if(!CalendarCountryById(ev.country_id, country))
+      return false;
+
+   currency = country.currency;
+   return (currency != "");
+}
+
 bool PassNewsFilter(string &reason)
 {
    reason = "";
@@ -306,10 +375,14 @@ bool PassNewsFilter(string &reason)
       if(ev.importance != CALENDAR_IMPORTANCE_HIGH)
          continue;
 
-      if(!CurrencyIsRelevant(ev.currency))
+      string evCurrency;
+      if(!GetEventCurrency(ev, evCurrency))
          continue;
 
-      reason = "Bloqueo noticia HIGH: " + ev.currency + " / " + ev.name;
+      if(!CurrencyIsRelevant(evCurrency))
+         continue;
+
+      reason = "Bloqueo noticia HIGH: " + evCurrency + " / " + ev.name;
       return false;
    }
 
@@ -373,25 +446,17 @@ double CalcVolumeByRisk(const double entryPrice, const double slPrice, double &r
 
    double rawVol = riskMoney / moneyPerLot;
 
-   double volMin  = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MIN);
-   double volMax  = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MAX);
-   double volStep = SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_STEP);
-
-   if(volStep <= 0.0)
-      volStep = volMin;
-
-   double vol = MathFloor(rawVol / volStep) * volStep;
-   vol = MathMax(vol, volMin);
-   vol = MathMin(vol, volMax);
+   double vol = NormalizeVolumeByStep(rawVol);
 
    riskMoneyOut = moneyPerLot * vol;
-   return NormalizeDouble(vol, 2);
+   return vol;
 }
 
 bool CheckStopsDistance(const ENUM_ORDER_TYPE type, const double price, const double sl)
 {
    int stopsLevel = (int)SymbolInfoInteger(g_symbol, SYMBOL_TRADE_STOPS_LEVEL);
-   double minDist = stopsLevel * g_point;
+   int freezeLevel = (int)SymbolInfoInteger(g_symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double minDist = (double)MathMax(stopsLevel, freezeLevel) * g_point;
 
    double ask = SymbolInfoDouble(g_symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(g_symbol, SYMBOL_BID);
@@ -465,13 +530,14 @@ bool PlacePendingOrder(const ENUM_ORDER_TYPE type, const double volume, const do
    req.action       = TRADE_ACTION_PENDING;
    req.symbol       = g_symbol;
    req.magic        = InpMagic;
-   req.volume       = volume;
+   req.volume       = NormalizeVolumeByStep(volume);
    req.type         = type;
    req.price        = NormalizeDouble(price, g_digits);
    req.sl           = NormalizeDouble(sl, g_digits);
    req.tp           = 0.0;
    req.type_time    = ORDER_TIME_DAY;
-   req.type_filling = (ENUM_ORDER_TYPE_FILLING)SymbolInfoInteger(g_symbol, SYMBOL_FILLING_MODE);
+   // Para pendientes, ORDER_FILLING_RETURN es el modo seguro recomendado.
+   req.type_filling = ORDER_FILLING_RETURN;
    req.comment      = comment;
 
    string checkReason;
@@ -712,10 +778,9 @@ void ManageOpenPosition()
 
    if(reached1R && !g_partialTaken)
    {
-      double closeVol = MathMax(SymbolInfoDouble(g_symbol, SYMBOL_VOLUME_MIN), vol * 0.5);
-      closeVol = NormalizeDouble(closeVol, 2);
+      double closeVol = NormalizeVolumeByStep(vol * 0.5);
 
-      if(g_trade.PositionClosePartial(g_symbol, closeVol))
+      if(closeVol < vol && g_trade.PositionClosePartial(g_symbol, closeVol))
       {
          g_partialTaken = true;
          // mover a break-even
@@ -960,6 +1025,8 @@ void OnTick()
 
    g_ordersPlaced = true;
    g_entryReason = "ORB breakout + filtros spread/ATR/news";
+   g_lastSpreadAtEntry = spreadPts;
+   g_lastAtrAtEntry = atrNow;
 
    Log(StringFormat("OCO colocada. BuyStop=%.5f SellStop=%.5f Vol=%.2f ATR=%.5f SpreadPts=%.1f",
                     buyEntry, sellEntry, vol, atrNow, spreadPts));
@@ -984,7 +1051,6 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
          return;
 
       long entryType = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
-      double price   = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
       double profit  = HistoryDealGetDouble(dealTicket, DEAL_PROFIT) +
                        HistoryDealGetDouble(dealTicket, DEAL_SWAP) +
                        HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
@@ -1005,41 +1071,54 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,
             long pType = PositionGetInteger(POSITION_TYPE);
             double pOpen = PositionGetDouble(POSITION_PRICE_OPEN);
             double pSL = PositionGetDouble(POSITION_SL);
+            double pVol = PositionGetDouble(POSITION_VOLUME);
+            ulong posId = (ulong)PositionGetInteger(POSITION_IDENTIFIER);
 
             g_entryPrice = pOpen;
             g_slPrice = pSL;
             g_initialRiskPoints = MathAbs(pOpen - pSL) / g_point;
-            g_initialRiskMoney = AccountInfoDouble(ACCOUNT_EQUITY) * (InpRiskPerTradePct / 100.0);
+            g_initialRiskMoney = CalcMoneyRiskForVolume(pVol, pOpen, pSL);
+            g_positionId = posId;
+            g_tradeRealizedPnl = 0.0;
+            g_partialTaken = false;
 
             if(pType == POSITION_TYPE_BUY)
+            {
+               g_entryDirection = "BUY";
                g_tp2Price = pOpen + 2.0 * (g_initialRiskPoints * g_point);
+            }
             else
+            {
+               g_entryDirection = "SELL";
                g_tp2Price = pOpen - 2.0 * (g_initialRiskPoints * g_point);
+            }
 
-            Log("Entrada ejecutada. RiskPoints=" + DoubleToString(g_initialRiskPoints, 1));
+            Log(StringFormat("Entrada ejecutada. Dir=%s Vol=%.2f RiskPoints=%.1f RiskMoneyReal=%.2f",
+                             g_entryDirection, pVol, g_initialRiskPoints, g_initialRiskMoney));
          }
       }
-      else if(entryType == DEAL_ENTRY_OUT)
+      else if(entryType == DEAL_ENTRY_OUT || entryType == DEAL_ENTRY_OUT_BY)
       {
+         ulong dealPosId = (ulong)HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+         if(g_positionId != 0 && dealPosId == g_positionId)
+            g_tradeRealizedPnl += profit;
+
          // cierre total o parcial
-         if(!PositionSelect(g_symbol))
+         if(g_positionId != 0 && dealPosId == g_positionId && !PositionSelect(g_symbol))
          {
             // posición completamente cerrada => registrar métricas por trade
             double rResult = 0.0;
             if(g_initialRiskMoney > 0.0)
-               rResult = profit / g_initialRiskMoney;
+               rResult = g_tradeRealizedPnl / g_initialRiskMoney;
 
-            UpdatePerformanceFromClosedDeal(profit);
+            UpdatePerformanceFromClosedDeal(g_tradeRealizedPnl);
 
-            double spreadPts = (SymbolInfoDouble(g_symbol, SYMBOL_ASK) - SymbolInfoDouble(g_symbol, SYMBOL_BID)) / g_point;
-            double atrNow = 0.0, atrMed = 0.0;
-            GetATRCurrentAndMedian(atrNow, atrMed);
-
-            string dir = (g_entryPrice >= g_slPrice ? "BUY" : "SELL");
-            LogTradeCSV(dir, g_entryPrice, g_slPrice, g_tp2Price, spreadPts, atrNow,
-                        g_entryReason, "Exit deal", rResult);
+            LogTradeCSV(g_entryDirection, g_entryPrice, g_slPrice, g_tp2Price, g_lastSpreadAtEntry, g_lastAtrAtEntry,
+                        g_entryReason, "Exit completo", rResult);
 
             g_partialTaken = false;
+            g_positionId = 0;
+            g_tradeRealizedPnl = 0.0;
          }
       }
    }
