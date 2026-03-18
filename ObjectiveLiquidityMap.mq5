@@ -1,7 +1,7 @@
 #property strict
 #property indicator_chart_window
 #property indicator_plots 0
-#property version   "1.10"
+#property version   "1.20"
 #property description "Objective Liquidity Map (price-inferred, no trading)"
 
 // ==========================================================
@@ -25,21 +25,57 @@ input bool     InpShowEqualHighLow         = true;         // Mostrar EQH/EQL
 input bool     InpShowSwingZones           = true;         // Mostrar Swing High/Low agrupados
 input bool     InpShowDailyLevels          = true;         // Mostrar PDH/PDL
 input bool     InpShowWeeklyLevels         = true;         // Mostrar PWH/PWL
-input bool     InpShowSessionLevels        = true;         // Mostrar sesiones
+input bool     InpShowSessionLevels        = false;         // Mostrar sesiones
 input bool     InpShowSweeps               = true;         // Mostrar sweeps
 input bool     InpShowLabels               = true;         // Mostrar etiquetas
 input bool     InpShowScore                = true;         // Mostrar score en etiqueta
 
 input int      InpMaxZonesPerType          = 8;            // Máximo de zonas por tipo
 input ENUM_LINE_STYLE InpLineStyle         = STYLE_SOLID;  // Estilo de línea
-input int      InpLineWidth                = 1;            // Grosor línea
-input int      InpZoneTransparencyActive   = 35;           // Transparencia zonas intactas (0-255)
-input int      InpZoneTransparencySwept    = 130;          // Transparencia zonas barridas
+input int      InpLineWidth                = 3;            // Grosor línea
+input int      InpZoneTransparencyActive   = 95;           // Transparencia zonas intactas (0-255)
+input int      InpZoneTransparencySwept    = 170;          // Transparencia zonas barridas
+input bool     InpDrawZoneRectangles        = true;         // Dibujar rectángulo de zona
+input int      InpLabelBarsRight            = 1;            // Barras a la derecha para etiqueta
+
+// Filtro visual por cercanía
+input bool     InpShowAllZones              = false;        // Mostrar todas las zonas (sin filtro de cercanía)
+input int      InpNearestAboveCount         = 2;            // Zonas más cercanas por encima
+input int      InpNearestBelowCount         = 2;            // Zonas más cercanas por debajo
+input bool     InpEnableMaxDistanceFilter   = false;         // Limitar por distancia máxima
+input int      InpMaxDistancePoints         = 350;          // Distancia máxima en puntos
+input bool     InpUseATRDistance            = false;         // Usar distancia máxima por ATR
+input double   InpMaxDistanceATR            = 1.50;         // Distancia máxima en ATR
+
+// Panel debug visual
+input bool     InpShowDebugPanel            = true;         // Mostrar panel de depuración
+input ENUM_BASE_CORNER InpDebugCorner       = CORNER_RIGHT_UPPER;
+input int      InpDebugX                    = 14;
+input int      InpDebugY                    = 18;
+
+// Modos de visualización
+enum VisualMode
+{
+   VM_CLEAN = 0,
+   VM_SESSION,
+   VM_FULL
+};
+input VisualMode InpVisualMode              = VM_CLEAN;
+input bool     InpSessionModeIncludeDaily   = true;         // En modo SESSION, incluir PDH/PDL
+
+// Filtros por tipo (modo "solo")
+input bool     InpOnlyPDH_PDL               = false;
+input bool     InpOnlyPWH_PWL               = false;
+input bool     InpOnlyEQH_EQL               = false;
+input bool     InpOnlySessions              = false;
+input bool     InpOnlyUntouched             = false;
+input bool     InpHideTaken                 = true;
+input bool     InpHideSimpleSwings          = true;
 
 // ---------------------------
 // Multi-timeframe
 // ---------------------------
-input bool             InpUseMTF            = true;         // Habilitar lectura MTF
+input bool             InpUseMTF            = false;         // Habilitar lectura MTF
 input ENUM_TIMEFRAMES  InpMTF1              = PERIOD_H1;    // TF superior 1
 input bool             InpUseMTF2           = true;         // Habilitar TF superior 2
 input ENUM_TIMEFRAMES  InpMTF2              = PERIOD_H4;    // TF superior 2
@@ -68,16 +104,16 @@ input int      InpNewYorkEndMinute          = 0;
 // Colores por tipo
 // ---------------------------
 input color    InpColorEQH                  = clrTomato;
-input color    InpColorEQL                  = clrMediumSeaGreen;
+input color    InpColorEQL                  = clrLimeGreen;
 input color    InpColorSwingHigh            = clrOrange;
 input color    InpColorSwingLow             = clrDeepSkyBlue;
 input color    InpColorPDH                  = clrGold;
-input color    InpColorPDL                  = clrGold;
+input color    InpColorPDL                  = clrKhaki;
 input color    InpColorPWH                  = clrDarkOrange;
-input color    InpColorPWL                  = clrDarkOrange;
-input color    InpColorAsia                 = clrSlateBlue;
-input color    InpColorLondon               = clrCadetBlue;
-input color    InpColorNewYork              = clrSandyBrown;
+input color    InpColorPWL                  = clrSandyBrown;
+input color    InpColorAsia                 = clrMediumPurple;
+input color    InpColorLondon               = clrTurquoise;
+input color    InpColorNewYork              = clrLightSkyBlue;
 input color    InpColorSweepMarker          = clrWhite;
 
 // ---------------------------
@@ -107,6 +143,13 @@ enum ZoneType
    ZT_NEWYORK_LOW
 };
 
+enum ZoneState
+{
+   ZS_UNTOUCHED = 0,
+   ZS_TAKEN,
+   ZS_REJECTION_SWEEP
+};
+
 struct LiquidityZone
 {
    double          priceMid;
@@ -115,9 +158,9 @@ struct LiquidityZone
    int             touches;
    ZoneType        type;
    ENUM_TIMEFRAMES sourceTF;
-   bool            swept;
+   ZoneState       state;
    int             score;
-   datetime        createdTime;
+   datetime        firstTouchTime;
    datetime        lastTouchTime;
    datetime        lastSweepTime;
 };
@@ -132,6 +175,9 @@ struct SweepMark
 
 LiquidityZone g_zones[];
 SweepMark     g_sweeps[];
+
+int g_totalZonesDetected = 0;
+int g_totalZonesDrawn = 0;
 
 // ==========================================================
 // Utilidades generales
@@ -180,14 +226,6 @@ bool IsHighSideType(const ZoneType t)
            t == ZT_ASIA_HIGH || t == ZT_LONDON_HIGH || t == ZT_NEWYORK_HIGH);
 }
 
-bool IsEquivalentPair(const ZoneType a, const ZoneType b)
-{
-   if((a == ZT_EQH && b == ZT_SWING_HIGH) || (a == ZT_SWING_HIGH && b == ZT_EQH))
-      return true;
-   if((a == ZT_EQL && b == ZT_SWING_LOW) || (a == ZT_SWING_LOW && b == ZT_EQL))
-      return true;
-   return false;
-}
 
 color ZoneColor(const ZoneType t)
 {
@@ -209,6 +247,26 @@ color ZoneColor(const ZoneType t)
       case ZT_NEWYORK_LOW:  return InpColorNewYork;
    }
    return clrSilver;
+}
+
+bool CreateObjectChecked(const string name, const ENUM_OBJECT type,
+                         const datetime t1, const double p1,
+                         const datetime t2 = 0, const double p2 = 0.0)
+{
+   ResetLastError();
+   bool ok;
+   if(type == OBJ_HLINE)
+      ok = ObjectCreate(0, name, type, 0, 0, p1);
+   else if(type == OBJ_LABEL)
+      ok = ObjectCreate(0, name, type, 0, 0, 0);
+   else if(type == OBJ_TEXT || type == OBJ_ARROW)
+      ok = ObjectCreate(0, name, type, 0, t1, p1);
+   else
+      ok = ObjectCreate(0, name, type, 0, t1, p1, t2, p2);
+
+   if(!ok)
+      Print("[ObjectiveLiquidityMap] ObjectCreate falló: ", name, " err=", GetLastError());
+   return ok;
 }
 
 void ClearObjectsByPrefix(const string prefix)
@@ -277,12 +335,27 @@ double DynamicTolerance(const double &atrSeries[], const int shift)
 // ==========================================================
 // Gestión/agrupación de zonas
 // ==========================================================
+
+bool IsMergeCompatibleType(const ZoneType a, const ZoneType b)
+{
+   if(a == b)
+      return true;
+
+   if((a == ZT_SWING_HIGH && b == ZT_EQH) || (a == ZT_EQH && b == ZT_SWING_HIGH))
+      return true;
+
+   if((a == ZT_SWING_LOW && b == ZT_EQL) || (a == ZT_EQL && b == ZT_SWING_LOW))
+      return true;
+
+   return false;
+}
+
 int FindMergeCandidate(const ZoneType t, const ENUM_TIMEFRAMES sourceTf, const double price, const double tol)
 {
    int n = ArraySize(g_zones);
    for(int i = 0; i < n; ++i)
    {
-      if(g_zones[i].type != t)
+      if(!IsMergeCompatibleType(g_zones[i].type, t))
          continue;
       if(g_zones[i].sourceTF != sourceTf)
          continue;
@@ -310,15 +383,23 @@ void AddOrMergeZone(const ZoneType t,
       z.touches       = touchesToAdd;
       z.type          = t;
       z.sourceTF      = sourceTf;
-      z.swept         = false;
+      z.state         = ZS_UNTOUCHED;
       z.score         = 0;
-      z.createdTime   = barTime;
+      z.firstTouchTime= barTime;
       z.lastTouchTime = barTime;
       z.lastSweepTime = 0;
 
       int n = ArraySize(g_zones);
       ArrayResize(g_zones, n + 1);
       g_zones[n] = z;
+
+      if(InpShowEqualHighLow)
+      {
+         if(t == ZT_SWING_HIGH && g_zones[n].touches >= InpMinTouches)
+            g_zones[n].type = ZT_EQH;
+         else if(t == ZT_SWING_LOW && g_zones[n].touches >= InpMinTouches)
+            g_zones[n].type = ZT_EQL;
+      }
       return;
    }
 
@@ -327,6 +408,9 @@ void AddOrMergeZone(const ZoneType t,
    g_zones[idx].priceMid = weighted;
    g_zones[idx].touches += touchesToAdd;
 
+   if(barTime < g_zones[idx].firstTouchTime)
+      g_zones[idx].firstTouchTime = barTime;
+
    if(barTime > g_zones[idx].lastTouchTime)
       g_zones[idx].lastTouchTime = barTime;
 
@@ -334,6 +418,14 @@ void AddOrMergeZone(const ZoneType t,
       g_zones[idx].priceUpper = price + tol;
    if(price - tol < g_zones[idx].priceLower)
       g_zones[idx].priceLower = price - tol;
+
+   if(InpShowEqualHighLow)
+   {
+      if(g_zones[idx].type == ZT_SWING_HIGH && g_zones[idx].touches >= InpMinTouches)
+         g_zones[idx].type = ZT_EQH;
+      else if(g_zones[idx].type == ZT_SWING_LOW && g_zones[idx].touches >= InpMinTouches)
+         g_zones[idx].type = ZT_EQL;
+   }
 }
 
 // ==========================================================
@@ -380,18 +472,16 @@ void DetectPivotsAndEqual(const MqlRates &rates[], const double &atrSeries[], co
 
       if(IsPivotHigh(rates, i, InpPivotLength))
       {
-         if(InpShowSwingZones)
-            AddOrMergeZone(ZT_SWING_HIGH, sourceTf, rates[i].high, tol, rates[i].time, 1);
-         if(InpShowEqualHighLow)
-            AddOrMergeZone(ZT_EQH, sourceTf, rates[i].high, tol, rates[i].time, 1);
+         // Regla anti-duplicidad:
+         // 1 toque => SWING_HIGH, 2+ toques => EQH (si está habilitado).
+         AddOrMergeZone(ZT_SWING_HIGH, sourceTf, rates[i].high, tol, rates[i].time, 1);
       }
 
       if(IsPivotLow(rates, i, InpPivotLength))
       {
-         if(InpShowSwingZones)
-            AddOrMergeZone(ZT_SWING_LOW, sourceTf, rates[i].low, tol, rates[i].time, 1);
-         if(InpShowEqualHighLow)
-            AddOrMergeZone(ZT_EQL, sourceTf, rates[i].low, tol, rates[i].time, 1);
+         // Regla anti-duplicidad:
+         // 1 toque => SWING_LOW, 2+ toques => EQL (si está habilitado).
+         AddOrMergeZone(ZT_SWING_LOW, sourceTf, rates[i].low, tol, rates[i].time, 1);
       }
    }
 }
@@ -523,30 +613,29 @@ void DetectSweepsAndState(const MqlRates &rates[])
 
    for(int z = 0; z < nz; ++z)
    {
-      g_zones[z].swept = false;
+      g_zones[z].state = ZS_UNTOUCHED;
       g_zones[z].lastSweepTime = 0;
 
       bool highSide = IsHighSideType(g_zones[z].type);
-      bool sawBreakout = false;
 
-      for(int i = nr - 2; i >= 1; --i)
+      // Arrays en serie: i=0 es la barra más reciente (normalmente en formación).
+      // Empezamos en i=1 para usar barra cerrada y capturar la barrida más RECIENTE.
+      for(int i = 1; i < nr - 1; ++i)
       {
          if(highSide)
          {
             if(rates[i].high > g_zones[z].priceUpper)
             {
-               sawBreakout = true;
+               g_zones[z].lastSweepTime = rates[i].time;
                if(rates[i].close < g_zones[z].priceMid)
                {
-                  g_zones[z].swept = true;
-                  g_zones[z].lastSweepTime = rates[i].time;
+                  g_zones[z].state = ZS_REJECTION_SWEEP;
                   if(InpShowSweeps)
                      AddSweepMark(rates[i].time, rates[i].high, g_zones[z].type, true);
                }
                else
                {
-                  g_zones[z].swept = true;
-                  g_zones[z].lastSweepTime = rates[i].time;
+                  g_zones[z].state = ZS_TAKEN;
                }
                break;
             }
@@ -555,28 +644,20 @@ void DetectSweepsAndState(const MqlRates &rates[])
          {
             if(rates[i].low < g_zones[z].priceLower)
             {
-               sawBreakout = true;
+               g_zones[z].lastSweepTime = rates[i].time;
                if(rates[i].close > g_zones[z].priceMid)
                {
-                  g_zones[z].swept = true;
-                  g_zones[z].lastSweepTime = rates[i].time;
+                  g_zones[z].state = ZS_REJECTION_SWEEP;
                   if(InpShowSweeps)
                      AddSweepMark(rates[i].time, rates[i].low, g_zones[z].type, false);
                }
                else
                {
-                  g_zones[z].swept = true;
-                  g_zones[z].lastSweepTime = rates[i].time;
+                  g_zones[z].state = ZS_TAKEN;
                }
                break;
             }
          }
-      }
-
-      if(!sawBreakout)
-      {
-         g_zones[z].swept = false;
-         g_zones[z].lastSweepTime = 0;
       }
    }
 }
@@ -623,22 +704,19 @@ void ScoreZones()
          if(i == j)
             continue;
 
-         if(g_zones[i].sourceTF == g_zones[j].sourceTF && IsEquivalentPair(g_zones[i].type, g_zones[j].type))
-            continue;
-
          if(MathAbs(g_zones[j].priceMid - g_zones[i].priceMid) <= tol)
             conf++;
       }
       score += MathMin(20, conf * 4);
 
-      // Recencia medida por último toque (más robusta que createdTime)
+      // Recencia medida por último toque (más robusta que firstTouchTime)
       int ageBars = iBarShift(_Symbol, PERIOD_CURRENT, g_zones[i].lastTouchTime, false);
       if(ageBars < 0)
          ageBars = 1000;
       score += MathMax(0, 12 - ageBars / 120);
 
       // Zonas intactas tienen más relevancia
-      if(!g_zones[i].swept)
+      if(g_zones[i].state == ZS_UNTOUCHED)
          score += 12;
       else
          score -= 8;
@@ -655,13 +733,32 @@ void ScoreZones()
 void SortIndicesByScore(int &idx[])
 {
    int n = ArraySize(idx);
+   double priceNow = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
    for(int i = 0; i < n - 1; ++i)
    {
       int best = i;
       for(int j = i + 1; j < n; ++j)
       {
-         if(g_zones[idx[j]].score > g_zones[idx[best]].score)
+         int ia = idx[best];
+         int ib = idx[j];
+
+         int pA = ZonePriority(g_zones[ia]);
+         int pB = ZonePriority(g_zones[ib]);
+         int rankA = g_zones[ia].score + (g_zones[ia].state == ZS_UNTOUCHED ? 20 : 0);
+         int rankB = g_zones[ib].score + (g_zones[ib].state == ZS_UNTOUCHED ? 20 : 0);
+
+         if(pB < pA)
             best = j;
+         else if(pB == pA && rankB > rankA)
+            best = j;
+         else if(pB == pA && rankB == rankA)
+         {
+            double da = MathAbs(g_zones[ia].priceMid - priceNow);
+            double db = MathAbs(g_zones[ib].priceMid - priceNow);
+            if(db < da)
+               best = j;
+         }
       }
       if(best != i)
       {
@@ -681,40 +778,63 @@ void DrawZone(const LiquidityZone &z, const int id)
    string txt  = base + "_T";
 
    color c = ZoneColor(z.type);
-   color cFill = ColorToARGB(c, z.swept ? InpZoneTransparencySwept : InpZoneTransparencyActive);
+   int alpha = InpZoneTransparencyActive;
+   if(z.state == ZS_TAKEN)
+      alpha = InpZoneTransparencySwept;
+   else if(z.state == ZS_REJECTION_SWEEP)
+      alpha = (InpZoneTransparencyActive + InpZoneTransparencySwept) / 2;
 
-   datetime t1 = z.createdTime;
+   color cFill = ColorToARGB(c, alpha);
+
+   datetime t1 = z.firstTouchTime;
    if(t1 <= 0)
       t1 = iTime(_Symbol, PERIOD_CURRENT, 200);
-   datetime t2 = TimeCurrent() + (datetime)(PeriodSeconds(PERIOD_CURRENT) * 25);
 
-   ObjectCreate(0, rect, OBJ_RECTANGLE, 0, t1, z.priceUpper, t2, z.priceLower);
-   ObjectSetInteger(0, rect, OBJPROP_COLOR, cFill);
-   ObjectSetInteger(0, rect, OBJPROP_FILL, true);
-   ObjectSetInteger(0, rect, OBJPROP_BACK, true);
-   ObjectSetInteger(0, rect, OBJPROP_STYLE, InpLineStyle);
-   ObjectSetInteger(0, rect, OBJPROP_WIDTH, 1);
-   ObjectSetInteger(0, rect, OBJPROP_SELECTABLE, false);
+   datetime tLast = iTime(_Symbol, PERIOD_CURRENT, 0);
+   datetime t2 = tLast + (datetime)(PeriodSeconds(PERIOD_CURRENT) * MathMax(1, InpLabelBarsRight));
 
-   ObjectCreate(0, line, OBJ_HLINE, 0, 0, z.priceMid);
-   ObjectSetInteger(0, line, OBJPROP_COLOR, c);
-   ObjectSetInteger(0, line, OBJPROP_STYLE, InpLineStyle);
-   ObjectSetInteger(0, line, OBJPROP_WIDTH, InpLineWidth);
-   ObjectSetInteger(0, line, OBJPROP_SELECTABLE, false);
+   if(InpDrawZoneRectangles)
+   {
+      if(CreateObjectChecked(rect, OBJ_RECTANGLE, t1, z.priceUpper, t2, z.priceLower))
+      {
+         ObjectSetInteger(0, rect, OBJPROP_COLOR, cFill);
+         ObjectSetInteger(0, rect, OBJPROP_FILL, true);
+         ObjectSetInteger(0, rect, OBJPROP_BACK, true);
+         ObjectSetInteger(0, rect, OBJPROP_STYLE, InpLineStyle);
+         ObjectSetInteger(0, rect, OBJPROP_WIDTH, 1);
+         ObjectSetInteger(0, rect, OBJPROP_SELECTABLE, false);
+      }
+   }
+
+   if(CreateObjectChecked(line, OBJ_HLINE, 0, z.priceMid))
+   {
+      ObjectSetInteger(0, line, OBJPROP_COLOR, c);
+      ObjectSetInteger(0, line, OBJPROP_STYLE, InpLineStyle);
+      ObjectSetInteger(0, line, OBJPROP_WIDTH, InpLineWidth + (z.state == ZS_UNTOUCHED ? 1 : 0));
+      ObjectSetInteger(0, line, OBJPROP_SELECTABLE, false);
+   }
 
    if(InpShowLabels)
    {
-      string status = z.swept ? "SWEPT" : "UNTOUCHED";
-      string text = ZoneTypeCode(z.type) + " " + tfCode + " " + status;
+      string status = "UNTOUCHED";
+      if(z.state == ZS_TAKEN)
+         status = "TAKEN";
+      else if(z.state == ZS_REJECTION_SWEEP)
+         status = "SWEEP";
+
+      string text = ZoneTypeCode(z.type) + " " + tfCode;
       if(InpShowScore)
          text += " " + IntegerToString(z.score);
+      text += " " + status;
 
-      ObjectCreate(0, txt, OBJ_TEXT, 0, t2, z.priceMid);
-      ObjectSetString(0, txt, OBJPROP_TEXT, text);
-      ObjectSetInteger(0, txt, OBJPROP_COLOR, c);
-      ObjectSetInteger(0, txt, OBJPROP_FONTSIZE, 8);
-      ObjectSetInteger(0, txt, OBJPROP_ANCHOR, ANCHOR_LEFT);
-      ObjectSetInteger(0, txt, OBJPROP_SELECTABLE, false);
+      if(CreateObjectChecked(txt, OBJ_TEXT, t2, z.priceMid))
+      {
+         ObjectSetString(0, txt, OBJPROP_TEXT, text);
+         ObjectSetInteger(0, txt, OBJPROP_COLOR, c);
+         ObjectSetInteger(0, txt, OBJPROP_FONTSIZE, 9);
+         ObjectSetInteger(0, txt, OBJPROP_ANCHOR, ANCHOR_LEFT);
+         ObjectSetInteger(0, txt, OBJPROP_SELECTABLE, false);
+      }
    }
 }
 
@@ -727,19 +847,143 @@ void DrawSweeps()
    for(int i = 0; i < n; ++i)
    {
       string name = g_prefix + "SWEEP_" + IntegerToString((int)g_sweeps[i].t) + "_" + IntegerToString(i);
-      ObjectCreate(0, name, OBJ_ARROW, 0, g_sweeps[i].t, g_sweeps[i].price);
-      ObjectSetInteger(0, name, OBJPROP_ARROWCODE, g_sweeps[i].isHighSweep ? 234 : 233);
-      ObjectSetInteger(0, name, OBJPROP_COLOR, InpColorSweepMarker);
-      ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
+      if(CreateObjectChecked(name, OBJ_ARROW, g_sweeps[i].t, g_sweeps[i].price))
+      {
+         ObjectSetInteger(0, name, OBJPROP_ARROWCODE, g_sweeps[i].isHighSweep ? 234 : 233);
+         ObjectSetInteger(0, name, OBJPROP_COLOR, InpColorSweepMarker);
+         ObjectSetInteger(0, name, OBJPROP_WIDTH, 2);
+         ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      }
+   }
+}
+
+int ZonePriority(const LiquidityZone &z)
+{
+   // Menor valor = mayor prioridad de dibujo
+   switch(z.type)
+   {
+      case ZT_PWH:
+      case ZT_PWL: return 1;
+      case ZT_PDH:
+      case ZT_PDL: return 2;
+      case ZT_EQH:
+      case ZT_EQL: return 3;
+      case ZT_ASIA_HIGH:
+      case ZT_ASIA_LOW:
+      case ZT_LONDON_HIGH:
+      case ZT_LONDON_LOW:
+      case ZT_NEWYORK_HIGH:
+      case ZT_NEWYORK_LOW: return 4;
+      case ZT_SWING_HIGH:
+      case ZT_SWING_LOW: return 5;
+   }
+   return 6;
+}
+
+bool IsSessionType(const ZoneType t)
+{
+   return (t == ZT_ASIA_HIGH || t == ZT_ASIA_LOW ||
+           t == ZT_LONDON_HIGH || t == ZT_LONDON_LOW ||
+           t == ZT_NEWYORK_HIGH || t == ZT_NEWYORK_LOW);
+}
+
+bool IsNearHigherPriorityLevel(const LiquidityZone &z)
+{
+   int pz = ZonePriority(z);
+   double tol = (double)InpEqualTolPoints * _Point * 1.2;
+
+   for(int i=0;i<ArraySize(g_zones);++i)
+   {
+      if(g_zones[i].priceMid == z.priceMid && g_zones[i].type == z.type && g_zones[i].sourceTF == z.sourceTF)
+         continue;
+      if(ZonePriority(g_zones[i]) < pz && MathAbs(g_zones[i].priceMid - z.priceMid) <= tol)
+         return true;
+   }
+   return false;
+}
+
+bool PassSoloFilters(const LiquidityZone &z)
+{
+   bool anySolo = (InpOnlyPDH_PDL || InpOnlyPWH_PWL || InpOnlyEQH_EQL || InpOnlySessions);
+   if(!anySolo)
+      return true;
+
+   bool allow = false;
+   if(InpOnlyPDH_PDL && (z.type == ZT_PDH || z.type == ZT_PDL)) allow = true;
+   if(InpOnlyPWH_PWL && (z.type == ZT_PWH || z.type == ZT_PWL)) allow = true;
+   if(InpOnlyEQH_EQL && (z.type == ZT_EQH || z.type == ZT_EQL)) allow = true;
+   if(InpOnlySessions && IsSessionType(z.type)) allow = true;
+   return allow;
+}
+
+bool PassVisualMode(const LiquidityZone &z)
+{
+   if(InpVisualMode == VM_FULL)
+      return true;
+
+   if(InpVisualMode == VM_SESSION)
+   {
+      if(IsSessionType(z.type))
+         return true;
+      if(InpSessionModeIncludeDaily && (z.type == ZT_PDH || z.type == ZT_PDL))
+         return true;
+      return false;
+   }
+
+   // VM_CLEAN
+   bool isCurrentTF = (z.sourceTF == (ENUM_TIMEFRAMES)_Period);
+   if(z.type == ZT_PWH || z.type == ZT_PWL || z.type == ZT_PDH || z.type == ZT_PDL)
+      return true;
+   if((z.type == ZT_EQH || z.type == ZT_EQL) && isCurrentTF)
+      return true;
+   if((z.type == ZT_SWING_HIGH || z.type == ZT_SWING_LOW) && isCurrentTF && !InpHideSimpleSwings)
+      return true;
+   return false;
+}
+
+void DrawDebugPanel(const bool filteredByDistance)
+{
+   if(!InpShowDebugPanel)
+      return;
+
+   string name = g_prefix + "DEBUG_PANEL";
+   string vm = "CLEAN";
+   if(InpVisualMode == VM_SESSION) vm = "SESSION";
+   else if(InpVisualMode == VM_FULL) vm = "FULL";
+   string mode = InpShowAllZones ? "ALL" : "NEAREST";
+   string filterTxt = filteredByDistance ? "DIST=ON" : "DIST=OFF";
+   double priceNow = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   string txt = "ObjectiveLiquidityMap\n" +
+                "Detected: " + IntegerToString(g_totalZonesDetected) + "\n" +
+                "Drawn: " + IntegerToString(g_totalZonesDrawn) + "\n" +
+                "Sweeps: " + IntegerToString(ArraySize(g_sweeps)) + "\n" +
+                "Price: " + DoubleToString(priceNow, _Digits) + "\n" +
+                "View: " + vm + " | " + mode + " " + filterTxt;
+
+   if(CreateObjectChecked(name, OBJ_LABEL, 0, 0))
+   {
+      ObjectSetInteger(0, name, OBJPROP_CORNER, InpDebugCorner);
+      ObjectSetInteger(0, name, OBJPROP_XDISTANCE, InpDebugX);
+      ObjectSetInteger(0, name, OBJPROP_YDISTANCE, InpDebugY);
+      ObjectSetInteger(0, name, OBJPROP_COLOR, clrWhite);
+      ObjectSetInteger(0, name, OBJPROP_FONTSIZE, 9);
+      ObjectSetString(0, name, OBJPROP_TEXT, txt);
       ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, name, OBJPROP_BACK, true);
    }
 }
 
 void DrawAllZones()
 {
    int n = ArraySize(g_zones);
+   g_totalZonesDetected = n;
+   g_totalZonesDrawn = 0;
    if(n <= 0)
+   {
+      DrawDebugPanel(false);
       return;
+   }
 
    int idx[];
    ArrayResize(idx, n);
@@ -751,7 +995,22 @@ void DrawAllZones()
    int countByType[14];
    ArrayInitialize(countByType, 0);
 
-   int drawn = 0;
+   double priceNow = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double maxDistPts = (double)InpMaxDistancePoints;
+   if(InpUseATRDistance)
+   {
+      double atrNow = GetATRValue(_Symbol, PERIOD_CURRENT, InpATRPeriod, 1);
+      if(atrNow > 0.0)
+         maxDistPts = MathMin(maxDistPts, (atrNow / _Point) * InpMaxDistanceATR);
+   }
+
+   int drawnAbove = 0;
+   int drawnBelow = 0;
+   bool filteredByDistance = false;
+
+   double drawnPrices[];
+   ArrayResize(drawnPrices, 0);
+
    for(int k = 0; k < n; ++k)
    {
       LiquidityZone z = g_zones[idx[k]];
@@ -760,23 +1019,89 @@ void DrawAllZones()
       if(countByType[t] >= InpMaxZonesPerType)
          continue;
 
+      // filtros base por tipo
       if((z.type == ZT_EQH || z.type == ZT_EQL) && !InpShowEqualHighLow) continue;
       if((z.type == ZT_SWING_HIGH || z.type == ZT_SWING_LOW) && !InpShowSwingZones) continue;
       if((z.type == ZT_PDH || z.type == ZT_PDL) && !InpShowDailyLevels) continue;
       if((z.type == ZT_PWH || z.type == ZT_PWL) && !InpShowWeeklyLevels) continue;
-      if((z.type == ZT_ASIA_HIGH || z.type == ZT_ASIA_LOW ||
-          z.type == ZT_LONDON_HIGH || z.type == ZT_LONDON_LOW ||
-          z.type == ZT_NEWYORK_HIGH || z.type == ZT_NEWYORK_LOW) && !InpShowSessionLevels) continue;
+      if(IsSessionType(z.type) && !InpShowSessionLevels && InpVisualMode != VM_SESSION && InpVisualMode != VM_FULL) continue;
+
+      // modo visual
+      if(!PassVisualMode(z))
+         continue;
+
+      // solo-filters
+      if(!PassSoloFilters(z))
+         continue;
+
+      // estados
+      if(InpOnlyUntouched && z.state != ZS_UNTOUCHED)
+         continue;
+      if(InpHideTaken && z.state == ZS_TAKEN)
+         continue;
+
+      // limpieza extra modo CLEAN
+      if(InpVisualMode == VM_CLEAN)
+      {
+         if((z.type == ZT_SWING_HIGH || z.type == ZT_SWING_LOW) && InpHideSimpleSwings)
+            continue;
+
+         if(IsNearHigherPriorityLevel(z))
+            continue;
+      }
 
       if((z.type == ZT_EQH || z.type == ZT_EQL) && z.touches < InpMinTouches)
          continue;
 
-      DrawZone(z, drawn);
+      double distPts = MathAbs(z.priceMid - priceNow) / _Point;
+      bool isAbove = (z.priceMid >= priceNow);
+
+      if(!InpShowAllZones)
+      {
+         if(InpEnableMaxDistanceFilter && distPts > maxDistPts)
+         {
+            filteredByDistance = true;
+            continue;
+         }
+
+         if(isAbove)
+         {
+            if(drawnAbove >= InpNearestAboveCount)
+               continue;
+         }
+         else
+         {
+            if(drawnBelow >= InpNearestBelowCount)
+               continue;
+         }
+      }
+
+      // evitar saturación por niveles demasiado cercanos
+      bool tooCloseToDrawn = false;
+      double overlapTolPts = (double)InpEqualTolPoints * 0.8;
+      for(int d=0; d<ArraySize(drawnPrices); ++d)
+      {
+         if(MathAbs(drawnPrices[d] - z.priceMid) / _Point <= overlapTolPts)
+         {
+            tooCloseToDrawn = true;
+            break;
+         }
+      }
+      if(tooCloseToDrawn)
+         continue;
+
+      DrawZone(z, g_totalZonesDrawn);
+      int nn = ArraySize(drawnPrices);
+      ArrayResize(drawnPrices, nn + 1);
+      drawnPrices[nn] = z.priceMid;
+
       countByType[t]++;
-      drawn++;
+      g_totalZonesDrawn++;
+      if(isAbove) drawnAbove++; else drawnBelow++;
    }
 
    DrawSweeps();
+   DrawDebugPanel(filteredByDistance);
 }
 
 // ==========================================================
@@ -815,28 +1140,45 @@ void RebuildLiquidityMap()
 {
    ArrayResize(g_zones, 0);
    ArrayResize(g_sweeps, 0);
+   g_totalZonesDetected = 0;
+   g_totalZonesDrawn = 0;
 
    // 1) Datos TF actual
    MqlRates ratesCur[];
    if(!LoadRates(_Symbol, PERIOD_CURRENT, InpBarsToAnalyze, ratesCur))
+   {
+      Print("[ObjectiveLiquidityMap] WARNING: LoadRates TF actual falló. No se pueden reconstruir zonas.");
+      ClearObjectsByPrefix(g_prefix);
+      DrawDebugPanel(false);
+      ChartRedraw(0);
       return;
+   }
 
+   // Si falla ATR, NO abortar. Se usa tolerancia fija por puntos.
    double atrCur[];
-   if(!LoadATRSeries(_Symbol, PERIOD_CURRENT, InpATRPeriod, ArraySize(ratesCur), atrCur))
-      return;
+   bool atrCurOk = LoadATRSeries(_Symbol, PERIOD_CURRENT, InpATRPeriod, ArraySize(ratesCur), atrCur);
+   if(!atrCurOk)
+      Print("[ObjectiveLiquidityMap] WARNING: ATR TF actual no disponible. Se usará tolerancia fija por puntos.");
 
    // 2) Pivots y equal highs/lows TF actual
-   DetectPivotsAndEqual(ratesCur, atrCur, PERIOD_CURRENT);
+   DetectPivotsAndEqual(ratesCur, atrCur, (ENUM_TIMEFRAMES)_Period);
 
-   // 3) MTF opcional (cada TF con su ATR propio)
+   // 3) MTF opcional (cada TF con su ATR propio; si falla, continuar)
    if(InpUseMTF)
    {
       MqlRates r1[];
       if(LoadRates(_Symbol, InpMTF1, MathMax(600, InpBarsToAnalyze / 3), r1))
       {
          double atr1[];
-         if(LoadATRSeries(_Symbol, InpMTF1, InpATRPeriod, ArraySize(r1), atr1))
-            DetectPivotsAndEqual(r1, atr1, InpMTF1);
+         bool atr1Ok = LoadATRSeries(_Symbol, InpMTF1, InpATRPeriod, ArraySize(r1), atr1);
+         if(!atr1Ok)
+            Print("[ObjectiveLiquidityMap] WARNING: ATR MTF1 no disponible (", TFCode(InpMTF1), "). Se usará tolerancia fija por puntos.");
+
+         DetectPivotsAndEqual(r1, atr1, InpMTF1);
+      }
+      else
+      {
+         Print("[ObjectiveLiquidityMap] WARNING: LoadRates MTF1 falló (", TFCode(InpMTF1), "). Se continúa con el resto.");
       }
 
       if(InpUseMTF2)
@@ -845,8 +1187,15 @@ void RebuildLiquidityMap()
          if(LoadRates(_Symbol, InpMTF2, MathMax(400, InpBarsToAnalyze / 6), r2))
          {
             double atr2[];
-            if(LoadATRSeries(_Symbol, InpMTF2, InpATRPeriod, ArraySize(r2), atr2))
-               DetectPivotsAndEqual(r2, atr2, InpMTF2);
+            bool atr2Ok = LoadATRSeries(_Symbol, InpMTF2, InpATRPeriod, ArraySize(r2), atr2);
+            if(!atr2Ok)
+               Print("[ObjectiveLiquidityMap] WARNING: ATR MTF2 no disponible (", TFCode(InpMTF2), "). Se usará tolerancia fija por puntos.");
+
+            DetectPivotsAndEqual(r2, atr2, InpMTF2);
+         }
+         else
+         {
+            Print("[ObjectiveLiquidityMap] WARNING: LoadRates MTF2 falló (", TFCode(InpMTF2), "). Se continúa con el resto.");
          }
       }
    }
@@ -866,6 +1215,12 @@ void RebuildLiquidityMap()
    // 8) Dibujo
    ClearObjectsByPrefix(g_prefix);
    DrawAllZones();
+
+   Print("[ObjectiveLiquidityMap] Rebuild completado. detected=", g_totalZonesDetected,
+         " drawn=", g_totalZonesDrawn,
+         " sweeps=", ArraySize(g_sweeps));
+
+   ChartRedraw(0);
 }
 
 // ==========================================================
